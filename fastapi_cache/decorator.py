@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import sys
 from functools import wraps
@@ -35,6 +36,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 P = ParamSpec("P")
 R = TypeVar("R")
+FUTURES = {}
 
 
 def _augment_signature(signature: Signature, *extra: Parameter) -> Signature:
@@ -181,25 +183,43 @@ def cache(
                 ttl, cached = 0, None
 
             if cached is None:  # cache miss
-                result = await ensure_async_func(*args, **kwargs)
-                to_cache = coder.encode(result)
+                if cache_key in FUTURES:
+                    future = FUTURES[cache_key]
+                    if not future.done():
+                        try:
+                            result = await future
+                            FUTURES.pop(cache_key, None)
+                        except Exception as e:
+                            logger.warning(f'Error in future "{cache_key}": {e}')
+                            raise
+                    else:
+                        result = future.result()
+                else:
+                    future = asyncio.Future()
+                    FUTURES[cache_key] = future
+                    try:
+                        result = await ensure_async_func(*args, **kwargs)
+                        future.set_result(result)
+                    finally:
+                        FUTURES.pop(cache_key, None)
+                    to_cache = coder.encode(result)
 
-                try:
-                    await backend.set(cache_key, to_cache, expire)
-                except Exception:
-                    logger.warning(
-                        f"Error setting cache key '{cache_key}' in backend:",
-                        exc_info=True,
-                    )
+                    try:
+                        await backend.set(cache_key, to_cache, expire)
+                    except Exception:
+                        logger.warning(
+                            f"Error setting cache key '{cache_key}' in backend:",
+                            exc_info=True,
+                        )
 
-                if response:
-                    response.headers.update(
-                        {
-                            "Cache-Control": f"max-age={expire}",
-                            "ETag": f"W/{hash(to_cache)}",
-                            cache_status_header: "MISS",
-                        }
-                    )
+                    if response:
+                        response.headers.update(
+                            {
+                                "Cache-Control": f"max-age={expire}",
+                                "ETag": f"W/{hash(to_cache)}",
+                                cache_status_header: "MISS",
+                            }
+                        )
 
             else:  # cache hit
                 if response:
